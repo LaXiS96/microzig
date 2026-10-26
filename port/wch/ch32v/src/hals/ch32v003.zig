@@ -6,6 +6,8 @@ pub const gpio = @import("ch32v003/gpio.zig");
 pub const clocks = @import("clocks.zig");
 pub const time = @import("time.zig");
 pub const debug = @import("debug.zig");
+pub const adc = @import("adc.zig");
+pub const opa = @import("opa.zig");
 
 /// HSI (High Speed Internal) oscillator frequency
 /// This is the fixed internal RC oscillator frequency for CH32V003
