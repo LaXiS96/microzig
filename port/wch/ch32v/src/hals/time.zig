@@ -7,6 +7,8 @@ const PFIC = peripherals.PFIC;
 const RCC = peripherals.RCC;
 const TIM2 = peripherals.TIM2;
 
+const is_ch32v003 = std.mem.eql(u8, microzig.config.chip_name, "CH32V003");
+
 /// Safely read the 64-bit SysTick counter (CNTH:CNTL).
 ///
 /// This implements the standard double-read pattern to avoid race conditions:
@@ -18,6 +20,10 @@ const TIM2 = peripherals.TIM2;
 ///
 /// This ensures we never get a value where low has rolled over but we read the old high value.
 inline fn read_stk_cnt() u64 {
+    // TODO should not use u64 on ch32v003, this might be why it stops after a while
+    if (is_ch32v003)
+        return PFIC.STK_CNTL.raw;
+
     while (true) {
         const high1: u32 = PFIC.STK_CNTH.raw;
         const low: u32 = PFIC.STK_CNTL.raw;
@@ -59,7 +65,8 @@ fn init_delay_counter() void {
 
     // Reset the count registers
     PFIC.STK_CNTL.raw = 0;
-    PFIC.STK_CNTH.raw = 0;
+    if (!is_ch32v003)
+        PFIC.STK_CNTH.raw = 0;
 }
 
 /// Initialize TIM2 to fire interrupts every 1ms for timekeeping.
@@ -67,7 +74,7 @@ fn init_delay_counter() void {
 /// This configures TIM2 to generate periodic interrupts that maintain the ticks_us counter.
 /// NOTE: This must be called AFTER configuring the system clock to the final frequency.
 fn init_tick_timer() void {
-    const freq: u32 = microzig.hal.clocks.get_sysclk();
+    const freq: u32 = microzig.hal.clocks.get_hclk();
 
     // Enable TIM2 clock (bit 0 of APB1PCENR)
     RCC.APB1PCENR.raw |= 1 << 0;
@@ -77,7 +84,9 @@ fn init_tick_timer() void {
     // = 48MHz / 48 / 1000 = 1kHz = 1ms
     const prescaler: u16 = @intCast((freq / 1_000_000) - 1); // Divide to 1MHz
     TIM2.PSC.modify(.{ .PSC = prescaler });
-    TIM2.ATRLR.modify(.{ .ARR = 999 }); // Count 1000 cycles = 1ms at 1MHz
+
+    // Note: different naming between CH32V003 (ATRLR) and others (ARR)
+    TIM2.ATRLR.raw = 999; // Count 1000 cycles = 1ms at 1MHz
 
     // Enable update interrupt
     TIM2.DMAINTENR.modify(.{ .UIE = 1 });
@@ -133,7 +142,7 @@ pub fn get_time_since_boot() time.Absolute {
 pub fn sleep_ms(time_ms: u32) void {
     const deadline = get_time_since_boot().add_duration(time.Duration.from_ms(time_ms));
     while (deadline.is_reached_by(get_time_since_boot()) == false) {
-        asm volatile ("" ::: .{ .memory = true });
+        asm volatile ("");
     }
 }
 
@@ -148,6 +157,7 @@ pub fn sleep_us(time_us: u64) void {
     }
 }
 
+// TODO on ch32v003, this breaks after a while
 /// Busy-wait for the specified number of microseconds using SysTick.
 ///
 /// Uses SysTick as a free-running 64-bit counter. This provides:
@@ -173,7 +183,7 @@ pub fn delay_us(us: u32) void {
         const current = read_stk_cnt();
 
         if (current - start >= ticks) break;
-        asm volatile ("" ::: .{ .memory = true });
+        asm volatile ("");
     }
 }
 

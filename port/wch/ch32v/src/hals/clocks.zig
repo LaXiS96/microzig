@@ -1,7 +1,11 @@
+const std = @import("std");
 const microzig = @import("microzig");
 
 const RCC = microzig.chip.peripherals.RCC;
 const EXTEND = microzig.chip.peripherals.EXTEND;
+const FLASH = microzig.chip.peripherals.FLASH;
+
+const is_ch32v003 = std.mem.eql(u8, microzig.config.chip_name, "CH32V003");
 
 pub const GPIO_Block = enum {
     A,
@@ -160,40 +164,76 @@ pub fn init(comptime config: Config) void {
 /// Initialize clocks from HSI to reach target frequency
 /// Assumes target_freq has been validated at compile time
 fn init_from_hsi(target_freq: u32) void {
-    // Calculate PLL configuration
-    // The HSIPRE bit controls whether HSI is divided before PLL
-    // PLLMUL bits control the PLL multiplier factor
+    // Ensure HSI is enabled and ready
+    RCC.CTLR.modify(.{ .HSION = 1 });
+    while (RCC.CTLR.read().HSIRDY != 1) {}
 
     // TODO: Make this more flexible.
+    var use_pll = false;
     if (target_freq == 8_000_000) {
-        // Use HSI directly at 8 MHz without PLL
-        // HSI is already enabled by default after reset
-        // Just ensure we're using HSI as system clock (should already be the case)
-        RCC.CFGR0.modify(.{ .SW = 0 }); // SW = 0 means HSI
-        while (RCC.CFGR0.read().SWS != 0) {}
-
-        // Configure bus prescalers (no division)
-        RCC.CFGR0.modify(.{
-            .HPRE = 0, // AHB prescaler = 1
-            .PPRE2 = 0, // APB2 prescaler = 1
-            .PPRE1 = 0, // APB1 prescaler = 1
-        });
+        if (is_ch32v003) {
+            RCC.CFGR0.modify(.{ .HPRE = 0b0010 }); // HCLK = SYSCLK / 3
+        } else {
+            // Use HSI directly at 8 MHz without PLL
+            RCC.CFGR0.modify(.{
+                .HPRE = 0, // AHB prescaler = 1
+                .PPRE2 = 0, // APB2 prescaler = 1
+                .PPRE1 = 0, // APB1 prescaler = 1
+            });
+        }
     } else if (target_freq == 48_000_000) {
-        // 48 MHz from 8 MHz HSI: HSI -> PLL (6x multiplier) -> 48 MHz
-        // HSIPRE = 1 means HSI not divided before PLL
-        EXTEND.EXTEND_CTR.modify(.{ .HSIPRE = 1 });
+        if (is_ch32v003) {
+            // HSI is 24MHz and PLL only multiplies by 2
+            FLASH.ACTLR.modify(.{ .LATENCY = 1 });
+            RCC.CFGR0.modify(.{
+                .HPRE = 0, // HCLK = SYSCLK
+                .PLLSRC = 0, // PLL source = HSI
+            });
+            use_pll = true;
+        } else {
+            // The HSIPRE bit controls whether HSI is divided before PLL
+            // PLLMUL bits control the PLL multiplier factor
+            // 48 MHz from 8 MHz HSI: HSI -> PLL (6x multiplier) -> 48 MHz
+            // HSIPRE = 1 means HSI not divided before PLL
+            EXTEND.EXTEND_CTR.modify(.{ .HSIPRE = 1 });
 
-        // Configure clock prescalers
-        RCC.CFGR0.modify(.{
-            .HPRE = 0, // AHB prescaler = 1 (no division)
-            .PPRE2 = 0, // APB2 prescaler = 1 (no division)
-            // TODO: Why is this 4, not 2? Check
-            .PPRE1 = 4, // APB1 prescaler = 2 (divide by 2)
-            .PLLSRC = 0, // PLL source = HSI
-            .PLLXTPRE = 0, // HSE divider for PLL = no division (unused for HSI)
-            .PLLMUL = 4, // PLL multiplier = 6 (value 4 = 6x)
-        });
+            // Configure clock prescalers
+            RCC.CFGR0.modify(.{
+                .HPRE = 0, // AHB prescaler = 1 (no division)
+                .PPRE2 = 0, // APB2 prescaler = 1 (no division)
+                // TODO: Why is this 4, not 2? Check
+                .PPRE1 = 4, // APB1 prescaler = 2 (divide by 2)
+                .PLLSRC = 0, // PLL source = HSI
+                .PLLXTPRE = 0, // HSE divider for PLL = no division (unused for HSI)
+                .PLLMUL = 4, // PLL multiplier = 6 (value 4 = 6x)
+            });
+            use_pll = true;
+        }
+    } else if (target_freq == 24_000_000) {
+        if (is_ch32v003) {
+            // HSI is 24MHz
+            RCC.CFGR0.modify(.{ .HPRE = 0 }); // HCLK = SYSCLK
+        } else {
+            // 24 MHz from 8 MHz HSI: HSI/2 -> PLL (6x multiplier) -> 24 MHz
+            // HSIPRE = 0 means HSI divided by 2 before PLL
+            EXTEND.EXTEND_CTR.modify(.{ .HSIPRE = 0 });
 
+            // Configure clock prescalers
+            RCC.CFGR0.modify(.{
+                .HPRE = 0, // AHB prescaler = 1 (no division)
+                .PPRE2 = 0, // APB2 prescaler = 1 (no division)
+                .PPRE1 = 0, // APB1 prescaler = 1 (no division)
+                .PLLSRC = 0, // PLL source = HSI
+                .PLLXTPRE = 0, // HSE divider (unused)
+                .PLLMUL = 4, // PLL multiplier = 6 (value 4 = 6x)
+            });
+            use_pll = true;
+        }
+    } else {
+        unreachable; // Should be caught by compile-time validation
+    }
+
+    if (use_pll) {
         // Enable PLL
         RCC.CTLR.modify(.{ .PLLON = 1 });
 
@@ -205,34 +245,12 @@ fn init_from_hsi(target_freq: u32) void {
 
         // Wait for PLL to be used as system clock (SWS should be 2)
         while (RCC.CFGR0.read().SWS != 2) {}
-    } else if (target_freq == 24_000_000) {
-        // 24 MHz from 8 MHz HSI: HSI/2 -> PLL (6x multiplier) -> 24 MHz
-        // HSIPRE = 0 means HSI divided by 2 before PLL
-        EXTEND.EXTEND_CTR.modify(.{ .HSIPRE = 0 });
-
-        // Configure clock prescalers
-        RCC.CFGR0.modify(.{
-            .HPRE = 0, // AHB prescaler = 1 (no division)
-            .PPRE2 = 0, // APB2 prescaler = 1 (no division)
-            .PPRE1 = 0, // APB1 prescaler = 1 (no division)
-            .PLLSRC = 0, // PLL source = HSI
-            .PLLXTPRE = 0, // HSE divider (unused)
-            .PLLMUL = 4, // PLL multiplier = 6 (value 4 = 6x)
-        });
-
-        // Enable PLL
-        RCC.CTLR.modify(.{ .PLLON = 1 });
-
-        // Wait for PLL to lock
-        while (RCC.CTLR.read().PLLRDY == 0) {}
-
-        // Select PLL as system clock
-        RCC.CFGR0.modify(.{ .SW = 2 });
-
-        // Wait for PLL to be used as system clock (SWS should be 2)
-        while (RCC.CFGR0.read().SWS != 2) {}
     } else {
-        unreachable; // Should be caught by compile-time validation
+        RCC.CTLR.modify(.{ .PLLON = 0 });
+
+        // Switch to HSI
+        RCC.CFGR0.modify(.{ .SW = 0 });
+        while (RCC.CFGR0.read().SWS != 0) {}
     }
 }
 
@@ -308,10 +326,16 @@ pub const ClockSpeeds = struct {
 
 // Prescaler lookup table for AHB/APB buses
 // Index into this table with the HPRE/PPRE bits, result is the shift amount
-const prescaler_table = [16]u8{ 0, 0, 0, 0, 1, 2, 3, 4, 1, 2, 3, 4, 6, 7, 8, 9 };
+const prescaler_table = if (is_ch32v003)
+    [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, 3, 4, 5, 6, 7, 8 }
+else
+    [16]u8{ 0, 0, 0, 0, 1, 2, 3, 4, 1, 2, 3, 4, 6, 7, 8, 9 };
 
 // ADC prescaler lookup table (divisor values)
-const adc_prescaler_table = [4]u8{ 2, 4, 6, 8 };
+const adc_prescaler_table = if (is_ch32v003)
+    [20]u8{ 2, 4, 6, 8, 4, 8, 12, 16, 8, 16, 24, 32, 16, 32, 48, 64, 32, 64, 96, 128 }
+else
+    [4]u8{ 2, 4, 6, 8 };
 
 /// Get HSI oscillator frequency from chip HAL
 fn get_hsi_value() u32 {
@@ -354,7 +378,7 @@ pub fn get_freqs() ClockSpeeds {
         2 => {
             // PLL used as system clock
             const cfgr0 = RCC.CFGR0.read();
-            const pllmul_bits = cfgr0.PLLMUL;
+            const pllmul_bits = if (!is_ch32v003) cfgr0.PLLMUL else 0;
             const pllsrc = cfgr0.PLLSRC;
 
             // PLL multiplication factor: PLLMUL bits + 2
@@ -364,7 +388,7 @@ pub fn get_freqs() ClockSpeeds {
 
             if (pllsrc == 0) {
                 // PLL source is HSI
-                const hsipre = EXTEND.EXTEND_CTR.read().HSIPRE;
+                const hsipre = if (!is_ch32v003) EXTEND.EXTEND_CTR.read().HSIPRE else 1;
                 if (hsipre == 1) {
                     // HSI not divided
                     sysclk = HSI_VALUE * pllmul;
@@ -374,7 +398,7 @@ pub fn get_freqs() ClockSpeeds {
                 }
             } else {
                 // PLL source is HSE
-                const pllxtpre = cfgr0.PLLXTPRE;
+                const pllxtpre = if (!is_ch32v003) cfgr0.PLLXTPRE else 0;
                 if (pllxtpre == 1) {
                     // HSE divided by 2 before PLL
                     sysclk = (HSE_VALUE >> 1) * pllmul;
@@ -393,20 +417,34 @@ pub fn get_freqs() ClockSpeeds {
     // Calculate AHB clock (HCLK) from SYSCLK using HPRE prescaler
     const hpre = RCC.CFGR0.read().HPRE;
     const hpre_shift = prescaler_table[hpre];
-    const hclk = sysclk >> @as(u5, @intCast(hpre_shift));
+    const hclk = if (is_ch32v003 and hpre < 8)
+        sysclk / hpre_shift
+    else
+        sysclk >> @as(u5, @intCast(hpre_shift));
 
-    // Calculate APB1 clock (PCLK1) from HCLK using PPRE1 prescaler
-    const ppre1 = RCC.CFGR0.read().PPRE1;
-    const ppre1_shift = prescaler_table[ppre1];
-    const pclk1 = hclk >> @as(u5, @intCast(ppre1_shift));
+    var pclk1 = hclk;
+    var pclk2 = hclk;
+    if (!is_ch32v003) {
+        // Calculate APB1 clock (PCLK1) from HCLK using PPRE1 prescaler
+        const ppre1 = RCC.CFGR0.read().PPRE1;
+        const ppre1_shift = prescaler_table[ppre1];
+        pclk1 = hclk >> @as(u5, @intCast(ppre1_shift));
 
-    // Calculate APB2 clock (PCLK2) from HCLK using PPRE2 prescaler
-    const ppre2 = RCC.CFGR0.read().PPRE2;
-    const ppre2_shift = prescaler_table[ppre2];
-    const pclk2 = hclk >> @as(u5, @intCast(ppre2_shift));
+        // Calculate APB2 clock (PCLK2) from HCLK using PPRE2 prescaler
+        const ppre2 = RCC.CFGR0.read().PPRE2;
+        const ppre2_shift = prescaler_table[ppre2];
+        pclk2 = hclk >> @as(u5, @intCast(ppre2_shift));
+    }
 
     // Calculate ADC clock from PCLK2 using ADCPRE
-    const adcpre = RCC.CFGR0.read().ADCPRE;
+    var adcpre = RCC.CFGR0.read().ADCPRE;
+    if (is_ch32v003) {
+        adcpre = ((adcpre & 0b11000) >> 3) | ((adcpre & 0b00111) << 2);
+        if ((adcpre & 0b10011) >= 4)
+            adcpre -= 12
+        else
+            adcpre &= 0b00011;
+    }
     const adc_divisor: u32 = adc_prescaler_table[adcpre];
     const adcclk = pclk2 / adc_divisor;
 
